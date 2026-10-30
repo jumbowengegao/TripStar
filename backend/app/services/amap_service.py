@@ -288,3 +288,239 @@ def reset_amap_service() -> None:
         _amap_service = None
     with _amap_mcp_tool_lock:
         _amap_mcp_tool = None
+
+
+# ============ 酒店周边搜索（住宿定制功能，直接走高德 REST） ============
+
+# 住宿类型 → 周边搜索关键词
+_HOTEL_TYPE_KEYWORDS = {
+    "民宿": "民宿",
+    "青年旅舍": "青年旅舍",
+}
+# 未提供真实价格时按住宿类型估算（元/晚），仅用于排序参考
+_HOTEL_TYPE_PRICE_FALLBACK = {
+    "经济型酒店": 250,
+    "舒适型酒店": 450,
+    "豪华酒店": 900,
+    "民宿": 350,
+    "青年旅舍": 100,
+}
+
+
+def geocode_address(address: str, city: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """关键词地理编码，返回 {"longitude", "latitude", "name"} 或 None（同步函数）。"""
+    import httpx
+
+    settings = get_settings()
+    params = {"key": settings.vite_amap_web_key, "address": address}
+    if city:
+        params["city"] = city
+    try:
+        resp = httpx.get(
+            "https://restapi.amap.com/v3/geocode/geo",
+            params=params,
+            timeout=8,
+            trust_env=False,
+        )
+        data = resp.json()
+        geocodes = data.get("geocodes") or []
+        if data.get("status") == "1" and geocodes:
+            loc = (geocodes[0].get("location") or "").split(",")
+            if len(loc) == 2:
+                return {
+                    "longitude": float(loc[0]),
+                    "latitude": float(loc[1]),
+                    "name": address,
+                }
+    except Exception as e:
+        print(f"❌ 酒店选点地理编码失败: {e}")
+    return None
+
+
+def _search_hotels_v5(api_key: str, location: str, radius: int, keyword: str) -> List[Dict[str, Any]]:
+    """高德 v5 周边搜索（可返回评分/人均消费），失败返回空列表。"""
+    import httpx
+
+    params = {
+        "key": api_key,
+        "location": location,
+        "radius": radius,
+        "types": "100000",  # 住宿服务
+        "page_size": 25,
+        "page_num": 1,
+        "show_fields": "business",
+    }
+    if keyword:
+        params["keywords"] = keyword
+    resp = httpx.get("https://restapi.amap.com/v5/place/around", params=params, timeout=8, trust_env=False)
+    data = resp.json()
+    if data.get("status") != "1":
+        return []
+
+    results = []
+    for poi in data.get("pois") or []:
+        biz = poi.get("business") or {}
+        rating_raw = str(biz.get("rating") or "").strip()
+        cost_raw = str(biz.get("cost") or "").strip()
+        rating = None
+        try:
+            if rating_raw and rating_raw not in ("[]", "0"):
+                rating = float(rating_raw)
+        except ValueError:
+            rating = None
+        cost = None
+        try:
+            if cost_raw and cost_raw not in ("[]", "0"):
+                cost = int(float(cost_raw))
+        except ValueError:
+            cost = None
+        loc = (poi.get("location") or "").split(",")
+        results.append({
+            "name": poi.get("name", ""),
+            "address": poi.get("address") or "",
+            "longitude": float(loc[0]) if len(loc) == 2 else None,
+            "latitude": float(loc[1]) if len(loc) == 2 else None,
+            "rating": rating,
+            "cost": cost,
+            "distance_m": int(poi["distance"]) if str(poi.get("distance", "")).isdigit() else None,
+            "hotel_type": (poi.get("type") or "").split(";")[0].split(":")[-1],
+        })
+    return results
+
+
+def _search_hotels_v3(api_key: str, location: str, radius: int, keyword: str) -> List[Dict[str, Any]]:
+    """高德 v3 周边搜索（无评分/价格字段），v5 失败时的回退。"""
+    import httpx
+
+    params = {
+        "key": api_key,
+        "location": location,
+        "radius": radius,
+        "types": "100000",
+        "offset": 25,
+        "page": 1,
+    }
+    if keyword:
+        params["keywords"] = keyword
+    resp = httpx.get("https://restapi.amap.com/v3/place/around", params=params, timeout=8, trust_env=False)
+    data = resp.json()
+    if data.get("status") != "1":
+        return []
+
+    results = []
+    for poi in data.get("pois") or []:
+        loc = (poi.get("location") or "").split(",")
+        results.append({
+            "name": poi.get("name", ""),
+            "address": poi.get("address") or "",
+            "longitude": float(loc[0]) if len(loc) == 2 else None,
+            "latitude": float(loc[1]) if len(loc) == 2 else None,
+            "rating": None,
+            "cost": None,
+            "distance_m": int(poi["distance"]) if str(poi.get("distance", "")).isdigit() else None,
+            "hotel_type": (poi.get("type") or "").split(";")[0].split("|")[0].split(":")[-1],
+        })
+    return results
+
+
+def search_hotels_around(
+    city: str,
+    center: Dict[str, Any],
+    radius: int,
+    accommodation_type: str,
+    price_min: Optional[int] = None,
+    price_max: Optional[int] = None,
+    sort_mode: str = "cost_perf",
+    limit: int = 8,
+) -> Dict[str, Any]:
+    """按中心点+半径搜索住宿候选，按评分/价格/性价比打分排序（同步函数）。
+
+    Args:
+        city: 城市（用于类型关键词兜底，当前搜索以坐标为准）
+        center: {"longitude": float, "latitude": float, "name": str}
+        radius: 搜索半径（米）
+        accommodation_type: 住宿类型（决定搜索关键词与价格估算兜底）
+        price_min/price_max: 每晚价格区间（元），仅过滤有真实价格数据的候选
+        sort_mode: rating / price / cost_perf
+        limit: 返回数量
+
+    Returns:
+        {"candidates": [HotelCandidate dict], "total_found": int, "price_estimated": bool}
+    """
+    settings = get_settings()
+    api_key = settings.vite_amap_web_key
+    location_str = f"{center['longitude']},{center['latitude']}"
+    keyword = _HOTEL_TYPE_KEYWORDS.get(accommodation_type, "酒店")
+
+    raw = _search_hotels_v5(api_key, location_str, radius, keyword)
+    source = "v5"
+    if not raw:
+        raw = _search_hotels_v3(api_key, location_str, radius, keyword)
+        source = "v3"
+
+    if not raw:
+        return {"candidates": [], "total_found": 0, "price_estimated": False, "source": source}
+
+    fallback_price = _HOTEL_TYPE_PRICE_FALLBACK.get(accommodation_type, 300)
+    price_estimated = False
+
+    # 价格过滤（仅对有真实价格的候选生效）
+    filtered = []
+    for item in raw:
+        if item["cost"] is not None:
+            if price_min is not None and item["cost"] < price_min:
+                continue
+            if price_max is not None and item["cost"] > price_max:
+                continue
+        else:
+            item["cost"] = fallback_price
+            item["price_is_estimate"] = True
+            price_estimated = True
+        filtered.append(item)
+
+    if not filtered:
+        return {"candidates": [], "total_found": len(raw), "price_estimated": price_estimated, "source": source}
+
+    # 归一化打分
+    costs = [it["cost"] for it in filtered]
+    c_min, c_max = min(costs), max(costs)
+    for it in filtered:
+        it["rating_score"] = round(it["rating"] / 5.0, 3) if it["rating"] else 0.0
+        if c_max > c_min:
+            it["price_score"] = round(1.0 - (it["cost"] - c_min) / (c_max - c_min), 3)
+        else:
+            it["price_score"] = 1.0
+        it["total_score"] = round(0.6 * it["rating_score"] + 0.4 * it["price_score"], 3)
+
+    if sort_mode == "rating":
+        filtered.sort(key=lambda it: (it["rating_score"], it["total_score"]), reverse=True)
+    elif sort_mode == "price":
+        filtered.sort(key=lambda it: (it["price_score"], it["total_score"]), reverse=True)
+    else:  # cost_perf
+        filtered.sort(key=lambda it: it["total_score"], reverse=True)
+
+    candidates = []
+    for it in filtered[:limit]:
+        candidates.append({
+            "name": it["name"],
+            "address": it["address"],
+            "location": (
+                {"longitude": it["longitude"], "latitude": it["latitude"]}
+                if it["longitude"] is not None else None
+            ),
+            "hotel_type": it["hotel_type"] or accommodation_type,
+            "rating": it["rating"],
+            "estimated_cost": it["cost"],
+            "distance_m": it["distance_m"],
+            "rating_available": it["rating"] is not None,
+            "rating_score": it["rating_score"],
+            "price_score": it["price_score"],
+            "total_score": it["total_score"],
+        })
+
+    return {
+        "candidates": candidates,
+        "total_found": len(raw),
+        "price_estimated": price_estimated,
+        "source": source,
+    }

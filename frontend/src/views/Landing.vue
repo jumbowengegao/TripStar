@@ -130,6 +130,7 @@
                   <a-select-option value="舒适型酒店">{{ t('home.accommodation.comfort') }}</a-select-option>
                   <a-select-option value="豪华酒店">{{ t('home.accommodation.luxury') }}</a-select-option>
                   <a-select-option value="民宿">{{ t('home.accommodation.homestay') }}</a-select-option>
+                  <a-select-option value="青年旅舍">{{ t('home.accommodation.hostel') }}</a-select-option>
                 </a-select>
               </a-form-item>
             </div>
@@ -482,82 +483,25 @@ const handleSubmit = async () => {
     panelHeight.value = panelRef.value.offsetHeight
   }
 
-  loading.value = true
-  loadingProgress.value = 5
-  loadingStatus.value = t('home.loading.initializing')
-  planCode.value = ''
+  // 分步流程：第一步仅收集行程信息，携带到 /pick 继续选择景点
+  const citiesPayload: CityStay[] = validCities.map(cs => ({ city: cs.city.trim(), days: cs.days || 1 }))
+  const endDate = computedEndDate.value!
 
-  try {
-    sessionStorage.removeItem('tripPlan')
-    sessionStorage.removeItem('graphData')
-    sessionStorage.removeItem('planId')
-
-    const citiesPayload: CityStay[] = validCities.map(cs => ({ city: cs.city.trim(), days: cs.days || 1 }))
-    const endDate = computedEndDate.value!
-
-    const requestData: TripFormData = {
-      city: citiesPayload[0].city,
-      cities: citiesPayload,
-      start_date: formData.start_date.format('YYYY-MM-DD'),
-      end_date: endDate.format('YYYY-MM-DD'),
-      travel_days: totalDays.value,
-      transportation: formData.transportation,
-      accommodation: formData.accommodation,
-      preferences: formData.preferences,
-      free_text_input: formData.free_text_input,
-      language: getCurrentLocale(),
-    }
-
-    const response = await generateTripPlan(requestData, {
-      onTaskCreated: (task) => {
-        planCode.value = task.plan_id || task.task_id
-        loadingProgress.value = 5
-        loadingStatus.value = t('home.loading.initializing')
-      },
-      onTaskEvent: (event) => {
-        if (event.plan_id) planCode.value = event.plan_id
-        if (Number.isFinite(event.progress)) {
-          loadingProgress.value = Math.max(0, Math.min(100, event.progress))
-        }
-        loadingStatus.value = event.message || getStageStatusText(event.stage)
-      }
-    })
-
-    loadingProgress.value = 100
-    loadingStatus.value = t('home.loading.done')
-
-    if (response.success && response.data) {
-      const planId = response.plan_id || planCode.value
-      sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
-      if (response.graph_data) sessionStorage.setItem('graphData', JSON.stringify(response.graph_data))
-      if (planId) sessionStorage.setItem('planId', planId)
-      message.success(t('home.messages.generateSuccess'))
-      setTimeout(() => {
-        if (planId) {
-          router.push({ path: '/result', query: { plan_id: planId } })
-        } else {
-          router.push('/result')
-        }
-      }, 500)
-    } else {
-      sessionStorage.removeItem('tripPlan')
-      sessionStorage.removeItem('graphData')
-      sessionStorage.removeItem('planId')
-      message.error(response.message || t('home.messages.generateFailed'))
-    }
-  } catch (error: any) {
-    sessionStorage.removeItem('tripPlan')
-    sessionStorage.removeItem('graphData')
-    sessionStorage.removeItem('planId')
-    message.error(error.message || t('home.messages.generateRetry'))
-  } finally {
-    setTimeout(() => {
-      loading.value = false
-      loadingProgress.value = 0
-      loadingStatus.value = ''
-      panelHeight.value = 'auto'
-    }, 1000)
+  const requestData: TripFormData = {
+    city: citiesPayload[0].city,
+    cities: citiesPayload,
+    start_date: formData.start_date.format('YYYY-MM-DD'),
+    end_date: endDate.format('YYYY-MM-DD'),
+    travel_days: totalDays.value,
+    transportation: formData.transportation,
+    accommodation: formData.accommodation,
+    preferences: formData.preferences,
+    free_text_input: formData.free_text_input,
+    language: getCurrentLocale(),
   }
+
+  sessionStorage.setItem('tripFormData', JSON.stringify(requestData))
+  router.push('/pick')
 }
 </script>
 

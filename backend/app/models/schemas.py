@@ -13,6 +13,125 @@ class CityStay(BaseModel):
     days: int = Field(..., description="在该城市停留天数", ge=1, le=15)
 
 
+class Location(BaseModel):
+    """地理位置"""
+    longitude: float = Field(..., description="经度")
+    latitude: float = Field(..., description="纬度")
+
+
+class HotelSelection(BaseModel):
+    """用户指定的住宿选择（来自前端 HotelPicker）"""
+    name: str = Field(..., description="酒店名称")
+    address: str = Field(default="", description="酒店地址")
+    location: Optional[Location] = Field(default=None, description="酒店经纬度")
+    type: str = Field(default="", description="住宿类型")
+    rating: Optional[str] = Field(default="", description="评分")
+    estimated_cost: int = Field(default=0, description="预估费用(元/晚)")
+
+
+class SelectedAttraction(BaseModel):
+    """用户在景点选择页勾选的景点（来自前端 AttractionPicker）"""
+    name: str = Field(..., description="景点名称(与候选列表中的 name 一致)")
+    name_zh: str = Field(default="", description="中文简体名称(用于地理编码)")
+    name_en: str = Field(default="", description="英文名称(用于 Google 编码)")
+    location: Optional[Location] = Field(default=None, description="景点经纬度")
+    duration: Optional[int] = Field(default=None, description="建议游玩时长(分钟)")
+    reason: str = Field(default="", description="小红书用户评价/避坑指南")
+    reservation_required: bool = Field(default=False, description="是否需要预约")
+    reservation_tips: str = Field(default="", description="预约提示")
+    region: str = Field(default="", description="所属区域(行政区/商圈)")
+
+
+class DayPlanAssignment(BaseModel):
+    """用户在行程规划弹窗中排好的某一天景点顺序"""
+    day: int = Field(..., ge=1, le=30, description="第几天(1 开始)")
+    attraction_names: List[str] = Field(default=[], description="该天要游览的景点名，按游览顺序排列")
+
+
+class AttractionSearchRequest(BaseModel):
+    """景点候选检索请求（小红书检索 + 按区域分组）"""
+    city: str = Field(..., description="目的地城市", example="西安")
+    preferences: List[str] = Field(default=[], description="偏好关键词", example=["历史文化"])
+    language: str = Field(default="zh", description="输出语言(zh/en/ja)")
+    limit: int = Field(default=18, ge=3, le=30, description="最多返回景点数")
+
+
+class AttractionOption(BaseModel):
+    """区域分组下的单个景点候选"""
+    name: str = Field(..., description="景点名称(按目标语言)")
+    name_zh: str = Field(default="", description="中文简体名称")
+    name_en: str = Field(default="", description="英文名称")
+    reason: str = Field(default="", description="小红书真实评价/避坑指南")
+    duration: Optional[int] = Field(default=None, description="建议游玩时长(分钟)")
+    reservation_required: bool = Field(default=False, description="是否需要提前预约")
+    reservation_tips: str = Field(default="", description="预约提示")
+    mention_count: int = Field(default=0, description="小红书笔记提及次数")
+    location: Optional[Location] = Field(default=None, description="经纬度")
+    address: str = Field(default="", description="地址")
+    rating: Optional[str] = Field(default="", description="高德评分(可能为空)")
+    region: str = Field(default="", description="所属区域")
+
+
+class AttractionRegionGroup(BaseModel):
+    """按区域聚合的景点分组"""
+    region: str = Field(..., description="区域名称(行政区/商圈)")
+    attractions: List[AttractionOption] = Field(default=[], description="该区域下的景点列表")
+
+
+class AttractionSearchResponse(BaseModel):
+    """景点候选检索响应"""
+    success: bool = Field(..., description="是否成功")
+    message: str = Field(default="", description="提示信息(降级原因等)")
+    city: str = Field(default="", description="城市")
+    regions: List[AttractionRegionGroup] = Field(default=[], description="按区域分组的景点")
+
+
+class HotelCandidatesRequest(BaseModel):
+    """酒店候选搜索请求"""
+    city: str = Field(..., description="所在城市", example="西安")
+    keywords: str = Field(default="", description="位置关键词(商圈/地标/地址)，与 location 二选一")
+    location: Optional[Location] = Field(default=None, description="中心点坐标(地图选点)")
+    radius: int = Field(default=3000, ge=500, le=10000, description="搜索半径(米)")
+    accommodation_type: str = Field(default="经济型酒店", description="住宿类型")
+    price_min: Optional[int] = Field(default=None, ge=0, description="每晚价格下限(元)")
+    price_max: Optional[int] = Field(default=None, ge=0, description="每晚价格上限(元)")
+    sort_mode: str = Field(default="cost_perf", description="排序: rating/price/cost_perf")
+    limit: int = Field(default=8, ge=1, le=20, description="返回候选数量")
+
+    @model_validator(mode='after')
+    def check_center(self):
+        if not self.location and not (self.keywords or '').strip():
+            raise ValueError("必须提供 location(地图选点) 或 keywords(位置关键词) 之一")
+        return self
+
+
+class HotelCandidate(BaseModel):
+    """单个酒店候选"""
+    name: str = Field(..., description="酒店名称")
+    address: str = Field(default="", description="地址")
+    location: Optional[Location] = Field(default=None, description="经纬度")
+    hotel_type: str = Field(default="", description="住宿类型")
+    rating: Optional[float] = Field(default=None, description="评分(0-5)，数据不可用时为 null")
+    estimated_cost: Optional[int] = Field(default=None, description="预估价格(元/晚)")
+    distance_m: Optional[int] = Field(default=None, description="距中心点距离(米)")
+    rating_available: bool = Field(default=False, description="评分数据是否可用")
+    rating_score: float = Field(default=0.0, description="评分归一化得分(0-1)")
+    price_score: float = Field(default=0.5, description="价格归一化得分(0-1，越高越便宜)")
+    total_score: float = Field(default=0.0, description="综合得分(0-1)")
+
+
+class HotelCandidatesResponse(BaseModel):
+    """酒店候选搜索响应"""
+    success: bool = Field(default=True)
+    message: str = Field(default="")
+    center: Optional[Location] = Field(default=None, description="搜索中心点")
+    center_name: str = Field(default="", description="中心点名称(关键词选点时)")
+    radius: int = Field(default=3000, description="搜索半径(米)")
+    sort_mode: str = Field(default="cost_perf", description="排序模式")
+    total_found: int = Field(default=0, description="搜索到的酒店总数")
+    candidates: List[HotelCandidate] = Field(default=[], description="候选列表")
+
+
 class TripRequest(BaseModel):
     """旅行规划请求"""
     city: str = Field(default="", description="目的地城市(单城市兼容)", example="北京")
@@ -26,6 +145,9 @@ class TripRequest(BaseModel):
     free_text_input: Optional[str] = Field(default="", description="额外要求", example="希望多安排一些博物馆")
     language: Optional[str] = Field(default="zh", description="输出语言(zh/en/ja)", example="en")
     user_id: Optional[str] = Field(default="", description="用户唯一标识(前端生成,用于记忆库)")
+    hotel_selection: Optional[HotelSelection] = Field(default=None, description="用户指定的住宿(可选,提供后行程将使用该酒店)")
+    selected_attractions: Optional[List[SelectedAttraction]] = Field(default=None, description="用户勾选的景点(可选,提供后跳过景点检索)")
+    daily_plan: Optional[List[DayPlanAssignment]] = Field(default=None, description="用户排好的每日景点顺序(可选,最高优先级约束)")
 
     @model_validator(mode='after')
     def normalize_cities(self):
@@ -69,12 +191,6 @@ class RouteRequest(BaseModel):
 
 
 # ============ 响应模型 ============
-
-class Location(BaseModel):
-    """地理位置"""
-    longitude: float = Field(..., description="经度")
-    latitude: float = Field(..., description="纬度")
-
 
 class Attraction(BaseModel):
     """景点信息"""

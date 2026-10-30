@@ -120,9 +120,17 @@
                   <a-select-option value="舒适型酒店">{{ t('home.accommodation.comfort') }}</a-select-option>
                   <a-select-option value="豪华酒店">{{ t('home.accommodation.luxury') }}</a-select-option>
                   <a-select-option value="民宿">{{ t('home.accommodation.homestay') }}</a-select-option>
+                  <a-select-option value="青年旅舍">{{ t('home.accommodation.hostel') }}</a-select-option>
                 </a-select>
               </a-form-item>
             </div>
+
+            <!-- 住宿定制：位置/范围/类型/评分价格性价比筛选 -->
+            <HotelPicker
+              :city="formData.city"
+              :accommodation-type="formData.accommodation"
+              @selection-change="onHotelSelectionChange"
+            />
 
             <a-form-item name="preferences">
               <template #label>
@@ -201,7 +209,8 @@ import { useI18n } from 'vue-i18n'
 import { message } from 'ant-design-vue'
 import { generateTripPlan, getOrCreateUserId } from '@/services/api'
 import { getCurrentLocale } from '@/i18n'
-import type { TripFormData, TripTaskEvent } from '@/types'
+import HotelPicker from '@/components/HotelPicker.vue'
+import type { TripFormData, TripTaskEvent, HotelSelection } from '@/types'
 import type { Dayjs } from 'dayjs'
 
 const router = useRouter()
@@ -249,8 +258,13 @@ const formData = reactive<HomeFormData>({
   transportation: '公共交通',
   accommodation: '经济型酒店',
   preferences: [],
-  free_text_input: ''
+  free_text_input: '',
+  hotel_selection: null as HotelSelection | null
 })
+
+const onHotelSelectionChange = (selection: HotelSelection | null) => {
+  formData.hotel_selection = selection
+}
 
 const togglePreference = (value: string) => {
   const idx = formData.preferences.indexOf(value)
@@ -314,6 +328,7 @@ const handleSubmit = async () => {
       accommodation: formData.accommodation,
       preferences: formData.preferences,
       free_text_input: formData.free_text_input,
+      hotel_selection: formData.hotel_selection || null,
       language: getCurrentLocale(),
       user_id: getOrCreateUserId(),
     }

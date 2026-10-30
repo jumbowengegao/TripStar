@@ -99,6 +99,105 @@ export interface TripFormData {
   free_text_input: string
   language?: string
   user_id?: string
+  hotel_selection?: HotelSelection | null
+  selected_attractions?: SelectedAttraction[] | null
+  daily_plan?: DayPlanAssignment[] | null
+}
+
+// ============ 景点选择（AttractionPicker） ============
+
+export interface AttractionOption {
+  name: string
+  name_zh: string
+  name_en: string
+  reason: string
+  duration?: number | null
+  reservation_required: boolean
+  reservation_tips: string
+  mention_count: number
+  location?: Location | null
+  address: string
+  rating?: string | null
+  region: string
+}
+
+export interface AttractionRegionGroup {
+  region: string
+  attractions: AttractionOption[]
+}
+
+export interface AttractionSearchResponse {
+  success: boolean
+  message: string
+  city: string
+  regions: AttractionRegionGroup[]
+}
+
+export interface SelectedAttraction {
+  name: string
+  name_zh?: string
+  name_en?: string
+  location?: Location | null
+  duration?: number | null
+  reason?: string
+  reservation_required?: boolean
+  reservation_tips?: string
+  region?: string
+}
+
+export interface DayPlanAssignment {
+  day: number
+  attraction_names: string[]
+}
+
+// ============ 住宿定制（HotelPicker） ============
+
+export interface HotelSelection {
+  name: string
+  address: string
+  location?: Location | null
+  type: string
+  rating?: string
+  estimated_cost: number
+}
+
+export interface HotelCandidate {
+  name: string
+  address: string
+  location?: Location | null
+  hotel_type: string
+  rating?: number | null
+  estimated_cost?: number | null
+  distance_m?: number | null
+  rating_available: boolean
+  rating_score: number
+  price_score: number
+  total_score: number
+}
+
+export type HotelSortMode = 'rating' | 'price' | 'cost_perf'
+
+export interface HotelCandidatesRequest {
+  city: string
+  keywords?: string
+  location?: Location | null
+  radius: number
+  accommodation_type: string
+  price_min?: number | null
+  price_max?: number | null
+  sort_mode: HotelSortMode
+  limit?: number
+}
+
+export interface HotelCandidatesResponse {
+  success: boolean
+  message: string
+  center?: Location | null
+  center_name: string
+  radius: number
+  sort_mode: string
+  total_found: number
+  candidates: HotelCandidate[]
 }
 
 export interface TripPlanResponse {

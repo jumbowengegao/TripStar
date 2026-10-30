@@ -1,6 +1,10 @@
 import axios from 'axios'
 import type {
+  AttractionSearchRequest,
+  AttractionSearchResponse,
   BackendRuntimeSettings,
+  HotelCandidatesRequest,
+  HotelCandidatesResponse,
   RuntimeSettings,
   TripFormData,
   TripHistoryItem,
@@ -272,6 +276,36 @@ export async function saveRuntimeSettings(settings: RuntimeSettings): Promise<Ru
     api_base_url: apiBaseUrl,
     ...backend,
     vite_amap_web_js_key: mapJsKey || backend.vite_amap_web_js_key,
+  }
+}
+
+/**
+ * 景点定制：检索按区域分组的景点候选（小红书来源）
+ */
+export async function fetchAttractionCandidates(
+  req: AttractionSearchRequest
+): Promise<AttractionSearchResponse> {
+  try {
+    const response = await apiClient.post('/api/trip/attractions', req)
+    return response.data
+  } catch (error: any) {
+    console.error('检索景点候选失败:', error)
+    throw new Error(error.response?.data?.detail || error.message || t('api.searchAttractionsFailed'))
+  }
+}
+
+/**
+ * 住宿定制：搜索酒店候选（按评分/价格/性价比排序）
+ */
+export async function searchHotelCandidates(
+  req: HotelCandidatesRequest
+): Promise<HotelCandidatesResponse> {
+  try {
+    const response = await apiClient.post('/api/trip/hotel_candidates', req)
+    return response.data
+  } catch (error: any) {
+    console.error('搜索住宿候选失败:', error)
+    throw new Error(error.response?.data?.detail || error.message || t('api.searchHotelCandidatesFailed'))
   }
 }
 

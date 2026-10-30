@@ -464,18 +464,48 @@ class MultiAgentTripPlanner:
                 progress_step = max(int(65 / total_cities / 3), 3)
                 city_label = f" ({idx+1}/{total_cities})" if total_cities > 1 else ""
 
-                # [1] 景点搜索
-                print(f"  [{idx+1}/{total_cities}] 正在搜索 {city} 的景点...")
-                await self._emit_progress(
-                    progress_callback, "attraction_search",
-                    f"正在搜索 {city} 的景点...{city_label}",
-                    progress_base
-                )
-                attraction_response = await asyncio.to_thread(
-                    search_xhs_attractions, city, keywords, _lang
-                )
-                all_attractions[city] = attraction_response
-                print(f"📍 {city} 景点搜索结果: {attraction_response[:150]}...")
+                # [1] 景点搜索（用户已勾选景点时跳过小红书检索）
+                selected_attractions = getattr(request, "selected_attractions", None) or []
+                if selected_attractions:
+                    print(f"  [{idx+1}/{total_cities}] 用户已选择 {len(selected_attractions)} 个景点，跳过景点检索")
+                    await self._emit_progress(
+                        progress_callback, "attraction_search",
+                        f"使用你选择的 {len(selected_attractions)} 个景点{city_label}",
+                        progress_base
+                    )
+                    attraction_lines = []
+                    for sa in selected_attractions:
+                        sa_dict = {
+                            "name": sa.name,
+                            "reason": sa.reason,
+                            "duration": sa.duration,
+                            "reservation_required": sa.reservation_required,
+                            "reservation_tips": sa.reservation_tips,
+                        }
+                        if sa.location is not None:
+                            sa_dict["location"] = {
+                                "longitude": sa.location.longitude,
+                                "latitude": sa.location.latitude,
+                            }
+                        attraction_lines.append(json.dumps(sa_dict, ensure_ascii=False))
+                    attraction_response = (
+                        "**以下是用户亲自选定的景点（必须且只能从中安排游览，禁止自行增删景点）:**\n"
+                        + "\n".join(attraction_lines)
+                    )
+                    all_attractions[city] = attraction_response
+                    print(f"📍 {city} 用户选点装载完成")
+                else:
+                    print(f"  [{idx+1}/{total_cities}] 正在搜索 {city} 的景点...")
+                    await self._emit_progress(
+                        progress_callback, "attraction_search",
+                        f"正在搜索 {city} 的景点...{city_label}",
+                        progress_base
+                    )
+                    attraction_response = await asyncio.to_thread(
+                        search_xhs_attractions, city, keywords, _lang
+                    )
+                    all_attractions[city] = attraction_response
+                    print(f"📍 {city} 景点搜索结果: {attraction_response[:150]}...")
 
                 # [2] 天气查询
                 print(f"  [{idx+1}/{total_cities}] 正在查询 {city} 的天气...")
@@ -499,17 +529,30 @@ class MultiAgentTripPlanner:
                         print(f"  ❌ {city} 高德天气降级也失败: {_wb_err}")
                 all_weather[city] = weather_response
 
-                # [3] 酒店搜索
-                print(f"  [{idx+1}/{total_cities}] 正在搜索 {city} 的酒店...")
-                await self._emit_progress(
-                    progress_callback, "hotel_search",
-                    f"正在搜索 {city} 的酒店...{city_label}",
-                    progress_base + progress_step * 2
-                )
-                hotel_query = f"请搜索{city}的{request.accommodation}酒店{_lang_hint}"
-                hotel_response = await asyncio.to_thread(self.hotel_agent.run, hotel_query)
-                all_hotels[city] = hotel_response
-                print(f"🏨 {city} 酒店搜索结果: {hotel_response[:150]}...")
+                # [3] 酒店搜索（用户已指定住宿时跳过 Agent 搜索）
+                hotel_selection = getattr(request, "hotel_selection", None)
+                if hotel_selection and (hotel_selection.name or "").strip():
+                    print(f"  [{idx+1}/{total_cities}] 用户已指定住宿，跳过酒店搜索: {hotel_selection.name}")
+                    await self._emit_progress(
+                        progress_callback, "hotel_search",
+                        f"使用你选择的住宿: {hotel_selection.name}{city_label}",
+                        progress_base + progress_step * 2
+                    )
+                    all_hotels[city] = (
+                        "**用户已指定住宿（必须严格使用，禁止更换为其它酒店）**\n"
+                        + json.dumps(hotel_selection.model_dump(mode="json"), ensure_ascii=False)
+                    )
+                else:
+                    print(f"  [{idx+1}/{total_cities}] 正在搜索 {city} 的酒店...")
+                    await self._emit_progress(
+                        progress_callback, "hotel_search",
+                        f"正在搜索 {city} 的酒店...{city_label}",
+                        progress_base + progress_step * 2
+                    )
+                    hotel_query = f"请搜索{city}的{request.accommodation}酒店{_lang_hint}"
+                    hotel_response = await asyncio.to_thread(self.hotel_agent.run, hotel_query)
+                    all_hotels[city] = hotel_response
+                    print(f"🏨 {city} 酒店搜索结果: {hotel_response[:150]}...")
 
             print(f"\n✅ 全部 {total_cities} 个城市基础信息搜集完成\n")
 
@@ -666,6 +709,44 @@ class MultiAgentTripPlanner:
 - 住宿: {request.accommodation}
 - 偏好: {', '.join(request.preferences) if request.preferences else '无'}
 """
+        # 用户排好的每日行程（最高优先级硬约束）
+        daily_plan = getattr(request, "daily_plan", None) or []
+        if daily_plan:
+            plan_lines = []
+            for dp in daily_plan:
+                if not dp.attraction_names:
+                    plan_lines.append(f"- 第{dp.day}天: 用户未指定，由你根据景点位置与时长自行安排")
+                    continue
+                ordered = " → ".join(
+                    f"{i+1}. {name}" for i, name in enumerate(dp.attraction_names)
+                )
+                plan_lines.append(f"- 第{dp.day}天: 依次游览 {ordered}")
+            query += f"""
+**⚠️ 每日行程硬约束（最高优先级，用户已亲自编排）:**
+{chr(10).join(plan_lines)}
+- 用户已指定顺序的天，景点选择与游览先后必须与上述完全一致，禁止增删景点、禁止调整顺序
+- 你只负责为这些景点补齐当天的时间轴、三餐、交通方式与费用；景点间的 visit_time/duration 按景点信息中的建议时长分配
+- 未指定的天由你按地理位置与建议时长自行编排
+"""
+        # 用户指定住宿时注入硬约束
+        hotel_selection = getattr(request, "hotel_selection", None)
+        if hotel_selection and (hotel_selection.name or "").strip():
+            sel_price = hotel_selection.estimated_cost or 0
+            sel_addr = hotel_selection.address or ""
+            sel_type = hotel_selection.type or request.accommodation
+            sel_loc = ""
+            if hotel_selection.location is not None:
+                sel_loc = (
+                    f'"longitude": {hotel_selection.location.longitude}, '
+                    f'"latitude": {hotel_selection.location.latitude}'
+                )
+            query += f"""
+**⚠️ 住宿硬约束（最高优先级）:**
+用户已亲自选定本次行程的住宿为「{hotel_selection.name}」（类型: {sel_type}，价格: {sel_price}元/晚，地址: {sel_addr}）。
+- days 数组中每一天的 hotel 对象必须使用该酒店: name 为「{hotel_selection.name}」，estimated_cost 固定为 {sel_price}，address 为「{sel_addr}」，type 为「{sel_type}」{f'，location 为 {{{sel_loc}}}' if sel_loc else ''}
+- 禁止推荐、替换或另选任何其它酒店
+- budget.total_hotels 按每晚 {sel_price} 元 × 行程天数计算（纯数字）
+"""
         if memory_snippet:
             query += f"""
 {memory_snippet}
@@ -706,6 +787,7 @@ class MultiAgentTripPlanner:
 6. 景点的经纬度坐标要真实准确
 7. 如果天气或酒店信息不足，请基于保守、通用的旅行建议补齐，但不要输出"无法查询"之类的解释文字
 """
+
         if is_multi_city:
             query += """
 **多城市特殊要求:**

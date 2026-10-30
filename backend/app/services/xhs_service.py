@@ -316,6 +316,46 @@ def get_note_detail_ssr(note_id: str) -> dict:
 
 # ============ 景点搜索核心函数 ============
 
+def _collect_note_text(client: "XhsNativeClient", query: str, note_count: int = 4) -> str:
+    """搜索小红书笔记并拼接标题+正文文本（原生 API 优先，SSR 降级）。
+
+    抛出 XHSCookieExpiredError / XHSFetchError。
+    """
+    res_json = client.search_notes(keyword=query)
+    items = res_json.get("data", {}).get("items", [])[:note_count]
+
+    combined_text = ""
+    for i, note in enumerate(items):
+        if note.get("model_type") == "note":
+            note_card = note.get("note_card", {})
+            title = note_card.get("display_title", "")
+
+            # 尝试通过原生 API 获取笔记详情
+            desc = ""
+            try:
+                note_id = note.get("id", "")
+                xsec_token = note.get("xsec_token", "")
+                if note_id:
+                    detail_res = client.get_note_detail(note_id, xsec_token)
+                    detail_items = detail_res.get("data", {}).get("items", [])
+                    if detail_items:
+                        note_data = detail_items[0].get("note_card", {})
+                        desc = note_data.get("desc", "")
+            except Exception:
+                # 降级到 SSR 抓取
+                try:
+                    note_id = note.get("id", "")
+                    if note_id:
+                        detail = get_note_detail_ssr(note_id)
+                        desc = detail.get("desc", "")
+                except Exception:
+                    desc = ""
+
+            combined_text += f"\n笔记{i+1}:\n标题: {title}\n正文内容: {desc}\n"
+
+    return combined_text
+
+
 def search_xhs_attractions(city: str, keywords: str, language: str = "zh") -> str:
     """
     搜索小红书笔记，使用大模型极速提纯出结构化景点，
@@ -331,39 +371,7 @@ def search_xhs_attractions(city: str, keywords: str, language: str = "zh") -> st
     query = f"{city} {keywords} 旅游 景点攻略"
 
     try:
-        # 使用原生签名客户端搜索
-        res_json = client.search_notes(keyword=query)
-        items = res_json.get("data", {}).get("items", [])[:4]
-
-        combined_text = ""
-        for i, note in enumerate(items):
-            if note.get("model_type") == "note":
-                note_card = note.get("note_card", {})
-                title = note_card.get("display_title", "")
-
-                # 尝试通过原生 API 获取笔记详情
-                desc = ""
-                try:
-                    note_id = note.get("id", "")
-                    xsec_token = note.get("xsec_token", "")
-                    if note_id:
-                        detail_res = client.get_note_detail(note_id, xsec_token)
-                        detail_items = detail_res.get("data", {}).get("items", [])
-                        if detail_items:
-                            note_data = detail_items[0].get("note_card", {})
-                            desc = note_data.get("desc", "")
-                except Exception:
-                    # 降级到 SSR 抓取
-                    try:
-                        note_id = note.get("id", "")
-                        if note_id:
-                            detail = get_note_detail_ssr(note_id)
-                            desc = detail.get("desc", "")
-                    except Exception:
-                        desc = ""
-
-                combined_text += f"\n笔记{i+1}:\n标题: {title}\n正文内容: {desc}\n"
-
+        combined_text = _collect_note_text(client, query, note_count=4)
     except XHSCookieExpiredError:
         raise
     except (requests.Timeout, requests.ConnectionError) as e:
@@ -468,6 +476,180 @@ JSON 返回示例:
     except Exception as e:
         print(f"❌ 大模型提纯小红书数据异常: {e}")
         return "尝试提取小红书结构化数据失败，降级回常规处理。"
+
+
+# ============ 景点候选检索（供 /api/trip/attractions 使用，按区域分组） ============
+
+def _poi_lookup_amap(name_zh: str, city: str) -> Optional[dict]:
+    """高德 v3 place/text 搜索景点 POI，返回 location/区划/评分；失败返回 None。
+
+    返回: {"longitude","latitude","address","region","rating"}
+    """
+    settings = get_settings()
+    if not settings.vite_amap_web_key:
+        return None
+
+    params = {
+        "key": settings.vite_amap_web_key,
+        "keywords": name_zh,
+        "city": city,
+        "citylimit": "true",
+        "offset": 3,
+        "page": 1,
+        "output": "JSON",
+    }
+    try:
+        _wait_for_amap_geocode_slot()
+        resp = httpx.get("https://restapi.amap.com/v3/place/text", params=params, timeout=6, trust_env=False)
+        data = resp.json()
+        pois = data.get("pois") or [] if data.get("status") == "1" else []
+        for poi in pois:
+            loc = (poi.get("location") or "").split(",")
+            if len(loc) != 2:
+                continue
+            try:
+                lon, lat = float(loc[0]), float(loc[1])
+            except ValueError:
+                continue
+            biz = poi.get("biz_ext") or {}
+            rating_raw = str(biz.get("rating") or "").strip()
+            rating = rating_raw if rating_raw and rating_raw not in ("[]", "0") else ""
+            region = poi.get("adname") or poi.get("cityname") or ""
+            return {
+                "longitude": lon,
+                "latitude": lat,
+                "address": poi.get("address") or "",
+                "region": region,
+                "rating": rating,
+            }
+    except Exception as e:
+        print(f"高德 POI 查询异常 ({name_zh}): {e}")
+
+    return None
+
+
+def fetch_attractions_structured(
+    city: str,
+    keywords: str,
+    language: str = "zh",
+    limit: int = 18,
+) -> Dict[str, Any]:
+    """检索景点候选并按区域分组（同步函数，供独立接口调用）。
+
+    流程: 小红书搜索笔记 → LLM 提纯景点 → 高德 POI 查坐标/区划/评分 → 按区域聚合。
+    返回: {"regions": [{"region": str, "attractions": [dict]}], "message": str}
+    可能抛出 XHSCookieExpiredError / XHSFetchError。
+    """
+    print(f"🔍 [XHS_SERVICE] 景点候选检索: {city} {keywords}")
+    client = get_xhs_client()
+    query = f"{city} {keywords} 旅游 景点攻略"
+
+    combined_text = _collect_note_text(client, query, note_count=6)
+
+    if not combined_text:
+        return {"regions": [], "message": f"未在小红书检索到关于 {city} {keywords} 的内容。"}
+
+    # ======== LLM 提纯（与 search_xhs_attractions 同源的提示词 + mention 统计） ========
+    print(f"🧠 [XHS_SERVICE] 正在调用内联模型提纯景点候选...")
+    llm = get_llm()
+
+    _lang = (language or "zh").strip().lower().split("-")[0]
+    _lang_names = {"en": "English", "ja": "Japanese", "ko": "Korean", "fr": "French", "de": "German", "es": "Spanish"}
+    if _lang != "zh" and _lang in _lang_names:
+        translation_instruction = f"""
+**极其重要的翻译要求:**
+目标语言为 {_lang_names[_lang]}。你必须将提取结果中的 "name", "reason", "reservation_tips" 字段的内容翻译为 {_lang_names[_lang]}。
+- "name" 字段使用目标语言 {_lang_names[_lang]} 的景点名称。
+- "name_zh" 必须始终保持简体中文名称，"name_en" 必须始终保持英文名称，不受目标语言影响！
+- 严格保持 JSON schema 格式不变！
+"""
+    else:
+        translation_instruction = ""
+
+    extract_prompt = f"""
+请从以下真实的素人小红书打卡游记中，提纯出真实存在的【游玩景点】。
+要求返回严格的 JSON 数组格式(哪怕只提取到了1个)，切勿返回除了JSON以外的任何冗余 markdown 文字！
+{translation_instruction}
+数组中每个对象必须包含以下字段:
+"name": 景点官方名称(用于前端展示，按目标语言填写；若目标语言为中文则与 name_zh 相同)
+"name_zh": 景点的中文简体名称(必须是简体中文，此字段始终为中文)
+"name_en": 景点的英文名称(此字段始终为英文)
+"reason": 小红书用户的真实评价/避坑指南
+"duration": 游玩时长(数字, 分钟)
+"reservation_required": 是否需要提前预约(布尔值 true/false)
+"reservation_tips": 预约相关提示(字符串，不需要则填空字符串)
+"mentions": 该景点在所有游记中被提及的次数(整数，1 起)
+
+游记杂文内容如下:
+{combined_text}
+
+JSON 返回示例:
+[
+  {{"name": "故宫博物院", "name_zh": "故宫博物院", "name_en": "The Palace Museum", "reason": "必去打卡，建议走中轴线。", "duration": 240, "reservation_required": true, "reservation_tips": "需提前7天预约", "mentions": 3}}
+]
+"""
+    content = llm.invoke(
+        [{"role": "user", "content": extract_prompt}],
+        temperature=0.1,
+        stream=False,
+    )
+
+    json_match = re.search(r'\[.*\]', content, re.DOTALL)
+    if json_match:
+        extracted = json.loads(json_match.group())
+    else:
+        extracted = json.loads(content)
+
+    valid_items = [item for item in extracted if item.get("name")][:limit]
+
+    # ======== 高德 POI 补齐坐标/区划/评分 ========
+    def _resolve(item: dict) -> dict:
+        zh_name = item.get("name_zh") or item.get("name") or ""
+        poi = _poi_lookup_amap(zh_name, city) if zh_name else None
+        if not poi:
+            try:
+                loc = geocode_amap(zh_name or item.get("name", ""), city,
+                                   name_zh=item.get("name_zh", ""), name_en=item.get("name_en", ""))
+            except Exception:
+                loc = None
+            if loc:
+                poi = {"longitude": loc["longitude"], "latitude": loc["latitude"],
+                       "address": "", "region": "", "rating": ""}
+        item["_poi"] = poi
+        return item
+
+    if valid_items:
+        with ThreadPoolExecutor(max_workers=min(3, len(valid_items))) as pool:
+            valid_items = list(pool.map(_resolve, valid_items))
+
+    # ======== 按区域聚合 ========
+    regions: Dict[str, list] = {}
+    for item in valid_items:
+        poi = item.get("_poi")
+        region = (poi or {}).get("region") or "其他区域"
+        regions.setdefault(region, []).append({
+            "name": item.get("name", ""),
+            "name_zh": item.get("name_zh", ""),
+            "name_en": item.get("name_en", ""),
+            "reason": item.get("reason", ""),
+            "duration": item.get("duration"),
+            "reservation_required": bool(item.get("reservation_required", False)),
+            "reservation_tips": item.get("reservation_tips", "") or "",
+            "mention_count": int(item.get("mentions") or 1),
+            "location": (
+                {"longitude": poi["longitude"], "latitude": poi["latitude"]} if poi else None
+            ),
+            "address": (poi or {}).get("address", ""),
+            "rating": (poi or {}).get("rating", ""),
+            "region": region,
+        })
+
+    region_list = [
+        {"region": r, "attractions": attrs}
+        for r, attrs in sorted(regions.items(), key=lambda kv: -len(kv[1]))
+    ]
+    print(f"✅ [XHS_SERVICE] 景点候选检索完成: {len(valid_items)} 个景点 / {len(region_list)} 个区域")
+    return {"regions": region_list, "message": ""}
 
 
 # ============ 景点搜图 ============

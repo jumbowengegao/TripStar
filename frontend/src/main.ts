@@ -17,6 +17,11 @@ const router = createRouter({
       component: () => import('./views/Landing.vue')
     },
     {
+      path: '/pick',
+      name: 'AttractionPicker',
+      component: () => import('./views/AttractionPicker.vue')
+    },
+    {
       path: '/result',
       name: 'Result',
       component: () => import('./views/Result.vue')

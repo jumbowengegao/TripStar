@@ -12,7 +12,15 @@ from typing import Any, Dict
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from ...agents.trip_planner_agent import get_trip_planner_agent
-from ...models.schemas import TripPlanResponse, TripRequest
+from ...models.schemas import (
+    AttractionSearchRequest,
+    AttractionSearchResponse,
+    HotelCandidatesRequest,
+    HotelCandidatesResponse,
+    Location,
+    TripPlanResponse,
+    TripRequest,
+)
 from ...services.knowledge_graph_service import build_knowledge_graph
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
@@ -277,6 +285,97 @@ async def _update_task_state(
     _persist_task_state(task_id, task)
     event = _build_task_event(task_id, task, include_result=True)
     _broadcast_task_event(task_id, event)
+
+
+@router.post(
+    "/attractions",
+    summary="检索景点候选(按区域分组)",
+    description="小红书检索城市游记 → LLM 提纯景点 → 高德 POI 补齐坐标/区划/评分 → 按区域聚合返回，供用户挑选",
+)
+async def search_attraction_candidates(req: AttractionSearchRequest):
+    """景点定制第一步：返回按区域分组的景点候选列表。"""
+    from ...services.xhs_service import XHSCookieExpiredError, XHSFetchError, fetch_attractions_structured
+
+    keywords = req.preferences[0] if req.preferences else "景点"
+
+    try:
+        result = await asyncio.to_thread(
+            fetch_attractions_structured,
+            req.city.strip(),
+            keywords,
+            req.language,
+            req.limit,
+        )
+    except XHSCookieExpiredError:
+        raise HTTPException(status_code=502, detail="小红书 Cookie 已过期，请在设置中更新后重试")
+    except XHSFetchError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"景点检索失败: {e}")
+
+    return AttractionSearchResponse(
+        success=bool(result.get("regions")),
+        message=result.get("message", ""),
+        city=req.city.strip(),
+        regions=result.get("regions", []),
+    )
+
+
+@router.post(
+    "/hotel_candidates",
+    summary="搜索住宿候选",
+    description="按中心点(坐标或关键词)+半径+住宿类型搜索周边酒店，按评分/价格/性价比打分排序返回候选列表",
+)
+async def search_hotel_candidates(req: HotelCandidatesRequest):
+    """住宿定制：返回按评分/价格/性价比排序的酒店候选列表。"""
+    from ...services.amap_service import geocode_address, search_hotels_around
+
+    # 确定搜索中心点
+    if req.location is not None:
+        center = {
+            "longitude": req.location.longitude,
+            "latitude": req.location.latitude,
+            "name": req.keywords or "地图选点",
+        }
+        center_name = center["name"]
+    else:
+        geo = await asyncio.to_thread(geocode_address, req.keywords.strip(), req.city)
+        if geo is None:
+            return HotelCandidatesResponse(
+                success=False,
+                message=f"无法定位「{req.keywords}」，请尝试更具体的地标或商圈名称",
+            )
+        center = geo
+        center_name = geo.get("name") or req.keywords.strip()
+
+    result = await asyncio.to_thread(
+        search_hotels_around,
+        req.city,
+        center,
+        req.radius,
+        req.accommodation_type,
+        req.price_min,
+        req.price_max,
+        req.sort_mode,
+        req.limit,
+    )
+
+    hints = []
+    if result.get("price_estimated"):
+        hints.append("部分候选缺少真实价格数据，已按住宿类型估算，仅供参考")
+    if result.get("source") == "v3":
+        hints.append("评分数据暂不可用，已按价格与距离排序")
+
+    return HotelCandidatesResponse(
+        success=True,
+        message="；".join(hints),
+        center=Location(longitude=center["longitude"], latitude=center["latitude"]),
+        center_name=center_name,
+        radius=req.radius,
+        sort_mode=req.sort_mode,
+        total_found=result.get("total_found", 0),
+        candidates=result.get("candidates", []),
+    )
 
 
 @router.post(
